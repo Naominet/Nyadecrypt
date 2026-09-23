@@ -24,7 +24,7 @@
 ## 1 基本命令
 
 ~~~bash
-python decrypt.py <protected_pe>
+python Nyadecrypt.py <protected_pe>
 ~~~
 
 输出文件名会在扩展名前插入 .unpack：
@@ -39,7 +39,7 @@ module.dll   -> module.unpack.dll
 输入路径也可以是文件夹：
 
 ~~~bash
-python decrypt.py <folder>
+python Nyadecrypt.py <folder>
 ~~~
 
 文件夹模式会递归扫描当前文件夹及所有子文件夹，仅检查 `.exe` 和 `.dll` 文件。未检测到 CrackProof 壳的 PE 文件会自动跳过，单个文件失败不会中断后续处理。完成后会显示成功、跳过和失败数量。

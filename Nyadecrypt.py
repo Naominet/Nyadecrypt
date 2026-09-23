@@ -870,7 +870,7 @@ def find_tbl(data, info):
 # Main unpacker
 # ============================================================
 
-# Cross-layout target-header trailer (written by encrypt_crackproof.py for packs
+# Cross-layout target-header trailer (written by Nyaencrypt.py for packs
 # whose target program layout differs from the donor stub). It carries the
 # target's real section table + image sizing so we can emit a valid final PE
 # instead of the donor's layout. Absent on identity packs and stock CrackProof
@@ -3101,7 +3101,7 @@ def _process_candidate(in_file):
 def main(argv=None):
     args = sys.argv[1:] if argv is None else list(argv)
     if not args or len(args) > 2:
-        print('Usage: python decrypt.py <input_file_or_folder> [aes_tables_dir]')
+        print('Usage: python Nyadecrypt.py <input_file_or_folder> [aes_tables_dir]')
         print('Folder mode scans .exe and .dll files recursively; unpacked files are skipped.')
         return 2
 
