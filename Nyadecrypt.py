@@ -2719,7 +2719,11 @@ def _decrypt_file(in_file, file_data):
     compressed_info = u32(data, compressed_info_addr)
     print(f'  compressDataOffset = 0x{compress_data_offset:X}')
     print(f'  compressedDataInfo = 0x{compressed_info:08X}')
-    block_count = 0
+    # Read all records before decoding. A repacker may group contiguous pages
+    # into a large block whose destination overlaps info[3] and therefore the
+    # compressedInfo table itself. Interleaving table parsing and decompression
+    # corrupts the unread records in that valid overlap layout.
+    compressed_records = []
     while True:
         decrypt_data5(data, compressed_info, 16)
         src2  = u32(data, compressed_info)
@@ -2727,15 +2731,42 @@ def _decrypt_file(in_file, file_data):
         dst2  = u32(data, compressed_info + 8)
         d_sz2 = u32(data, compressed_info + 12)
         compressed_info += 16
-        if s_sz2 == 0: break
+        if s_sz2 == 0:
+            break
+        if (dst2 < 0x1000 or s_sz2 > d_sz2
+                or dst2 + d_sz2 > max(len(data), image_size)):
+            raise ValueError(f'invalid PE32 compressedInfo record: '
+                             f'src=0x{src2:X} ss=0x{s_sz2:X} '
+                             f'dst=0x{dst2:X} ds=0x{d_sz2:X}')
+        compressed_records.append((src2, s_sz2, dst2, d_sz2))
+
+    need = max([len(data), image_size] +
+               [max(dst2 + s_sz2, dst2 + d_sz2)
+                for _src2, s_sz2, dst2, d_sz2 in compressed_records])
+    if len(data) < need:
+        data.extend(b'\x00' * (need - len(data)))
+    # Preserve the AES schedule and Huffman tables above the image because an
+    # overlap block can overwrite their original RVAs before later blocks run.
+    scratch = len(data)
+    data.extend(b'\x00' * 0x4000)
+    key2 = scratch
+    key0 = scratch + 0x2000
+    data[key2:key2 + 0x1000] = data[key_offsets[2]:key_offsets[2] + 0x1000]
+    data[key0:key0 + 0x1000] = data[key_offsets[0]:key_offsets[0] + 0x1000]
+    for src2, s_sz2, dst2, d_sz2 in compressed_records:
         file_src = src2 + compress_data_offset
-        data[dst2:dst2 + s_sz2] = clean_file_data[file_src:file_src + s_sz2]
-        aes_decrypt(data, dst2, s_sz2, key_offsets[2])
+        chunk = clean_file_data[file_src:file_src + s_sz2]
+        if len(chunk) < s_sz2:
+            chunk += b'\x00' * (s_sz2 - len(chunk))
+        data[dst2:dst2 + s_sz2] = chunk
+        aes_decrypt(data, dst2, s_sz2, key2)
         _lut, _tt = file_dec
-        data[dst2:dst2 + s_sz2] = bytearray(bytes(data[dst2:dst2 + s_sz2]).translate(_tt))
+        data[dst2:dst2 + s_sz2] = bytearray(
+            bytes(data[dst2:dst2 + s_sz2]).translate(_tt))
         if s_sz2 != d_sz2:
-            decompress(data, dst2, dst2, key_offsets[0], s_sz2, d_sz2)
-        block_count += 1
+            decompress(data, dst2, dst2, key0, s_sz2, d_sz2)
+    del data[scratch:]
+    block_count = len(compressed_records)
     print(f'  Decrypted {block_count} data blocks')
 
     # Section fixup
