@@ -1177,20 +1177,40 @@ def unpack_template_pe32(file_data):
     d.w32(data, pe + 0xB0, 0)
     d.w32(data, pe + 0xB4, 0)
 
-    header_checksum = 0
-    hcs = tbl + 0x58
-    while u32(data, hcs + 4) != 0:
-        pa = u32(data, hcs); ps = u32(data, hcs + 4)
-        header_checksum ^= (d.crc32(data, pa, ps) ^ ps)
-        hcs += 8
     first_stage_cs = d.checksum_with_size_xor(data, tbl + 0xA8)
     second_stage_key = u32(data, tbl + 0x40)
     ss_pair = tbl + 0x98
-    ss_key = (header_checksum ^ first_stage_cs ^ second_stage_key) & 0xFFFFFFFF
-    d.decrypt_data3(data, ss_pair, ss_key, 21)
     ss = u32(data, ss_pair)
     ss_size = u32(data, ss_pair + 4)
+    if not (0x1000 <= ss < len(data) and 4 <= ss_size <= len(data) - ss):
+        raise ValueError(f'invalid SecondStage range 0x{ss:X}+0x{ss_size:X} (PE32)')
     ss_shift = ss_size - 0xBC0
+    third_pair_off = 0xB8C + ss_shift
+    encrypted_ss = bytes(data[ss:ss + ss_size])
+    second_stage_ok = False
+    for zero_reloc in (False, True):
+        if zero_reloc:
+            # Native PE32 DLLs may have a packer-added BaseReloc directory that
+            # was not present when the stage checksum was calculated.
+            d.w32(data, pe + 0xA0, 0)
+            d.w32(data, pe + 0xA4, 0)
+        header_checksum = 0
+        hcs = tbl + 0x58
+        while u32(data, hcs + 4) != 0:
+            header_checksum ^= d.checksum_with_size_xor(data, hcs)
+            hcs += 8
+        ss_key = (header_checksum ^ first_stage_cs ^ second_stage_key) & 0xFFFFFFFF
+        data[ss:ss + ss_size] = encrypted_ss
+        d.decrypt_data3(data, ss_pair, ss_key, 21)
+        pair_addr = ss + third_pair_off
+        ts_test = u32(data, pair_addr)
+        ts_size_test = u32(data, pair_addr + 4)
+        if (0x1000 < ts_test < len(data)
+                and 4 <= ts_size_test <= len(data) - ts_test):
+            second_stage_ok = True
+            break
+    if not second_stage_ok:
+        raise ValueError('SecondStage validation failed (PE32)')
 
     third_key_off = 0x968 + ss_shift
     forth_key_off = 0x964 + ss_shift
@@ -1323,61 +1343,117 @@ def unpack_template_pe32(file_data):
     eighth_start = u32(data, eighth_addr)
     eighth_dsz = u32(data, eighth_addr + 12)
 
-    # Fixed table offsets
-    off_file_cs = 0x3C68 + ss_shift
-    off_compressed_info = 0x3C78 + ss_shift
-    off_zero_list = 0x3C80 + ss_shift
-    off_file_lfsr = 0x40EC + ss_shift
+    # Locate the final-stage field cluster by its 0x7679 marker. Native PE32
+    # DLLs use a shorter eighth stage than the historical EXE layout.
+    marker_off = None
+    for off in range(0, max(0, eighth_dsz - 0x4C), 4):
+        ma = eighth_start + off
+        if ma + 0x34 > len(data):
+            break
+        if u32(data, ma) == 0x7679:
+            fcs_test = u32(data, ma + 0x30)
+            if info[3] < fcs_test < len(data):
+                marker_off = off
+                break
+    if marker_off is not None:
+        off_file_cs = marker_off + 0x30
+        off_compressed_info = marker_off + 0x40
+        off_zero_list = marker_off + 0x48
+        off_file_lfsr = marker_off + 0x4B4
+    else:
+        off_file_cs = 0x3C68 + ss_shift
+        off_compressed_info = 0x3C78 + ss_shift
+        off_zero_list = 0x3C80 + ss_shift
+        off_file_lfsr = 0x40EC + ss_shift
 
     compress_data_offset = ((~u32(file_data, 0x1080)) & 0xFFFFFFFF) + 0x1000
 
     # File checksums
     file_cs_addr = u32(data, eighth_start + off_file_cs)
     file_cs_size = u32(data, eighth_start + off_file_cs + 4)
+    if not (0 < file_cs_addr < len(data)):
+        raise ValueError(f'invalid file checksum table RVA 0x{file_cs_addr:X} (PE32)')
     if file_cs_size > 0:
-        fc_end = file_cs_addr + file_cs_size
+        fc_end = min(file_cs_addr + file_cs_size, len(data))
         fc = file_cs_addr
-        while fc < fc_end:
+        while fc + 16 <= fc_end:
             d.decrypt_data5(data, fc, 16)
             fc += 16
     else:
         fc = file_cs_addr
-        while u32(data, fc + 4) != 0:
+        while fc + 16 <= len(data) and u32(data, fc + 4) != 0:
             d.decrypt_data5(data, fc, 16)
             fc += 16
 
-    # File LFSR (validate fixed offset, fallback scan)
-    lfsr_off = off_file_lfsr
-    found = d.find_lfsr_block(data, eighth_start, eighth_dsz, lfsr_off)
-    if found != lfsr_off:
-        valid_op = {0x04, 0x2C, 0x34, 0x90, 0xC0, 0xC3, 0xFE}
-        cands = []
-        for so in range(off_zero_list, eighth_dsz - 95):
-            ab = eighth_start + so
-            sz = data[ab + 95]
-            if sz < 10 or sz > 95:
-                continue
-            lf = 1
-            dec = bytearray(sz)
-            src = data[ab:ab + sz]
-            for bi in range(sz):
-                b = src[bi]
-                for bit in range(8):
-                    b ^= ((lf & 1) << bit)
-                    lf <<= 1
-                    if lf & 0x8000:
-                        lf ^= 0x8003
-                    lf &= 0xFFFF
-                dec[bi] = b
-            if dec[0] in valid_op and 0xC3 in dec:
-                cands.append(so)
-        if cands:
-            exact = [c for c in cands if c == off_file_lfsr]
-            neg = sorted([c for c in cands if c < off_file_lfsr], key=lambda c: off_file_lfsr - c)
-            pos = sorted([c for c in cands if c > off_file_lfsr], key=lambda c: c - off_file_lfsr)
-            lfsr_off = exact[0] if exact else (neg[0] if neg else pos[0])
-        else:
-            raise ValueError('cannot locate file LFSR (PE32)')
+    def file_lfsr_validates(candidate_addr):
+        if candidate_addr < 0 or candidate_addr + 96 > len(data):
+            return False
+        snap = bytes(data[candidate_addr:candidate_addr + 96])
+        try:
+            d.decrypt_data6(data, candidate_addr)
+            candidate_dec = d.generate_custom_decryptor(data, candidate_addr)
+        except (IndexError, struct.error):
+            candidate_dec = None
+        finally:
+            data[candidate_addr:candidate_addr + 96] = snap
+        if candidate_dec is None:
+            return False
+        try:
+            slot = eighth_start + off_compressed_info
+            table = u32(data, slot)
+            if table == 0 or table + 16 > len(data):
+                return False
+            entry = table
+            for _ in range(256):
+                if entry + 16 > len(data):
+                    return False
+                src2 = d.trial_decrypt5_u32(data, entry)
+                s_sz2 = d.trial_decrypt5_u32(data, entry + 4)
+                dst2 = d.trial_decrypt5_u32(data, entry + 8)
+                d_sz2 = d.trial_decrypt5_u32(data, entry + 12)
+                if s_sz2 == 0:
+                    return False
+                if s_sz2 != d_sz2:
+                    fsrc = src2 + compress_data_offset
+                    if (dst2 < 0x1000 or s_sz2 > d_sz2
+                            or fsrc + s_sz2 > len(file_data)
+                            or dst2 + d_sz2 > len(data)):
+                        return False
+                    dst_snap = bytes(data[dst2:dst2 + d_sz2])
+                    try:
+                        data[dst2:dst2 + s_sz2] = file_data[fsrc:fsrc + s_sz2]
+                        d.aes_decrypt(data, dst2, s_sz2, key_offsets[2])
+                        _lut, tt = candidate_dec
+                        data[dst2:dst2 + s_sz2] = bytearray(
+                            bytes(data[dst2:dst2 + s_sz2]).translate(tt))
+                        return d.decompress(data, dst2, dst2, key_offsets[0],
+                                            s_sz2, d_sz2)
+                    finally:
+                        data[dst2:dst2 + d_sz2] = dst_snap
+                entry += 16
+        except (IndexError, struct.error):
+            return False
+        return False
+
+    # File LFSR. If the marker-relative expected offset falls beyond the short
+    # native-DLL stage, enumerate candidates and validate by decoding a block.
+    lfsr_off = None
+    if off_file_lfsr + 96 <= eighth_dsz:
+        found = d.find_lfsr_block(data, eighth_start, eighth_dsz, off_file_lfsr)
+        if found is not None and file_lfsr_validates(eighth_start + found):
+            lfsr_off = found
+    if lfsr_off is None:
+        scan = max(0, off_zero_list + 8)
+        while True:
+            cand = d.find_lfsr_block(data, eighth_start, eighth_dsz, scan)
+            if cand is None:
+                break
+            if file_lfsr_validates(eighth_start + cand):
+                lfsr_off = cand
+                break
+            scan = cand + 1
+    if lfsr_off is None:
+        raise ValueError('cannot locate/validate file LFSR (PE32)')
     file_dec_addr = eighth_start + lfsr_off
     d.decrypt_data6(data, file_dec_addr)
     file_dec = d.generate_custom_decryptor(data, file_dec_addr)
@@ -1387,7 +1463,8 @@ def unpack_template_pe32(file_data):
     meta = _capture_metadata(data, info[3], image_size)
 
     # zeroList runs BEFORE the file loop (PE32).
-    zero_ptr = u32(data, eighth_start + off_zero_list)
+    zero_list_addr = u32(data, eighth_start + off_zero_list)
+    zero_ptr = zero_list_addr
     while True:
         d.decrypt_data5(data, zero_ptr, 16)
         z_src = u32(data, zero_ptr); z_sz = u32(data, zero_ptr + 4)
@@ -1401,6 +1478,9 @@ def unpack_template_pe32(file_data):
     compressed_info_addr = u32(data, eighth_start + off_compressed_info)
     compressed_records = []
     ci = compressed_info_addr
+    # Read the complete table before decoding. Grouped repacks can decompress a
+    # large block across info[3], which overwrites the table before the next
+    # record is read if parsing and decoding are interleaved.
     while True:
         d.decrypt_data5(data, ci, 16)
         s2, ss2 = u32(data, ci), u32(data, ci + 4)
@@ -1408,14 +1488,32 @@ def unpack_template_pe32(file_data):
         ci += 16
         if ss2 == 0:
             break
+        if d2 < 0x1000 or ss2 > ds2 or d2 + ds2 > max(len(data), image_size):
+            raise ValueError(f'invalid compressedInfo record (PE32): '
+                             f'src=0x{s2:X} ss=0x{ss2:X} dst=0x{d2:X} ds=0x{ds2:X}')
         compressed_records.append((s2, ss2, d2, ds2))
+    need = max([len(data), image_size] +
+               [max(d2 + ss2, d2 + ds2) for _s2, ss2, d2, ds2 in compressed_records])
+    if len(data) < need:
+        data.extend(b'\x00' * (need - len(data)))
+    scratch = len(data)
+    data.extend(b'\x00' * 0x4000)
+    key2 = scratch
+    key0 = scratch + 0x2000
+    data[key2:key2 + 0x1000] = data[key_offsets[2]:key_offsets[2] + 0x1000]
+    data[key0:key0 + 0x1000] = data[key_offsets[0]:key_offsets[0] + 0x1000]
+    for s2, ss2, d2, ds2 in compressed_records:
         fsrc = s2 + compress_data_offset
-        data[d2:d2 + ss2] = file_data[fsrc:fsrc + ss2]
-        d.aes_decrypt(data, d2, ss2, key_offsets[2])
+        chunk = file_data[fsrc:fsrc + ss2]
+        if len(chunk) < ss2:
+            chunk += b'\x00' * (ss2 - len(chunk))
+        data[d2:d2 + ss2] = chunk
+        d.aes_decrypt(data, d2, ss2, key2)
         _lut, tt = file_dec
         data[d2:d2 + ss2] = bytearray(bytes(data[d2:d2 + ss2]).translate(tt))
         if ss2 != ds2:
-            d.decompress(data, d2, d2, key_offsets[0], ss2, ds2)
+            d.decompress(data, d2, d2, key0, ss2, ds2)
+    del data[scratch:]
     decoded_image = bytearray(data)
 
     prof = TemplateProfile()
@@ -1434,6 +1532,7 @@ def unpack_template_pe32(file_data):
     prof.file_cs_addr = file_cs_addr
     prof.data4_va = data4_va
     prof.data4_sz = data4_sz
+    prof.zero_list_addr = zero_list_addr
     if meta is not None:
         prof.meta_off, prof.meta_size, prof.meta_ep_rel, prof.meta_plain, prof.meta_ep = meta
     return prof
@@ -1982,11 +2081,13 @@ def w32(b, o, v): struct.pack_into('<I', b, o, v & 0xFFFFFFFF)
 
 # ----------------------------------------------------------------- target PE parse
 def parse_target(T):
-    """Parse an unpacked PE32+: returns dict with pe, image_size, ep, dirs(128B),
-    sections list, import_rva/size. T is the full RVA image (file_off == RVA)."""
+    """Parse an unpacked PE32/PE32+ flat RVA image."""
     pe = u32(T, 0x3C)
-    if u16(T, pe + 24) != 0x20B:
-        raise ValueError('target is not PE32+')
+    magic = u16(T, pe + 24)
+    if magic not in (0x10B, 0x20B):
+        raise ValueError(f'target has unsupported optional-header magic 0x{magic:X}')
+    is_pe32 = magic == 0x10B
+    dir_base = pe + (0x78 if is_pe32 else 0x88)
     opt = u16(T, pe + 20)
     nsec = u16(T, pe + 6)
     sectab = pe + 24 + opt
@@ -2001,11 +2102,13 @@ def parse_target(T):
         })
     return {
         'pe': pe, 'opt': opt, 'nsec': nsec, 'sectab': sectab,
+        'magic': magic, 'is_pe32': is_pe32, 'dir_base': dir_base,
+        'thunk_size': 4 if is_pe32 else 8,
         'image_size': u32(T, pe + 80),
         'ep': u32(T, pe + 40),
-        'dirs': bytes(T[pe + 0x88:pe + 0x88 + 128]),
-        'import_rva': u32(T, pe + 0x90), 'import_size': u32(T, pe + 0x94),
-        'clr_rva': u32(T, pe + 0xF8), 'clr_size': u32(T, pe + 0xFC),
+        'dirs': bytes(T[dir_base:dir_base + 128]),
+        'import_rva': u32(T, dir_base + 8), 'import_size': u32(T, dir_base + 12),
+        'clr_rva': u32(T, dir_base + 14 * 8), 'clr_size': u32(T, dir_base + 14 * 8 + 4),
         'file_chars': u16(T, pe + 22),
         'is_dll': bool(u16(T, pe + 22) & 0x2000),
         'sections': sections,
@@ -2030,15 +2133,18 @@ def encrypt_target_imports(img, tgt):
         if 0 < name_rva < n:
             e.encrypt_data7(img, name_rva, name_rva & 0xFF)
         thunk = oft if oft else iat
-        while thunk and thunk + 8 <= n:
-            v = struct.unpack_from('<Q', img, thunk)[0]
+        step = tgt['thunk_size']
+        ordinal_bit = 0x80000000 if step == 4 else 0x8000000000000000
+        unpack_fmt = '<I' if step == 4 else '<Q'
+        while thunk and thunk + step <= n:
+            v = struct.unpack_from(unpack_fmt, img, thunk)[0]
             if v == 0:
                 break
-            if not (v & 0x8000000000000000):
+            if not (v & ordinal_bit):
                 rv = v & 0xFFFFFFFF
                 if 0 < rv + 2 < n:
                     e.encrypt_data7(img, rv + 2, rv & 0xFF)
-            thunk += 8
+            thunk += step
         count += 1
         pos += 20
     return count
@@ -2120,8 +2226,9 @@ def _materialize_managed_loader_view(out, T, tgt):
     if not tgt['clr_rva']:
         return
     pe = u32(out, 0x3C)
-    packed_clr_rva = u32(out, pe + 0xF8)
-    packed_clr_size = u32(out, pe + 0xFC)
+    dir_base = pe + (0x78 if tgt['is_pe32'] else 0x88)
+    packed_clr_rva = u32(out, dir_base + 14 * 8)
+    packed_clr_size = u32(out, dir_base + 14 * 8 + 4)
     if not packed_clr_rva or packed_clr_size < 0x48:
         raise ValueError('selected runtime profile has no loader-visible CLR directory')
     if packed_clr_rva != tgt['clr_rva']:
@@ -2152,8 +2259,9 @@ def _validate_loader_view(out, T, tgt):
         raise ValueError('packed output DLL/EXE characteristic does not match target')
     if not tgt['clr_rva']:
         return
-    clr_rva = u32(out, pe + 0xF8)
-    clr_size = u32(out, pe + 0xFC)
+    dir_base = pe + (0x78 if tgt['is_pe32'] else 0x88)
+    clr_rva = u32(out, dir_base + 14 * 8)
+    clr_size = u32(out, dir_base + 14 * 8 + 4)
     if not clr_rva or clr_size < 0x48:
         raise ValueError('managed target became native: packed CLR directory is absent')
     cor_off = _pe_rva_to_raw(out, clr_rva, 0x48)
@@ -2271,6 +2379,17 @@ def pack_program(prof, S_fd, T, use_lz=False, do_imports=True, overlap=False):
         enc5 = e.encrypt_data5_record(struct.pack('<IIII', *rec), off)
         raw_shell[off:off + 16] = enc5
         e.encrypt_data4_at(raw_shell, off, 16, prof.data4_va)
+    # PE32 native DLLs keep zeroList at a separate fixed pointer after the
+    # original (much larger) compressedInfo table. Clear that real list too;
+    # placing a second terminator directly after the shortened new table is not
+    # sufficient because the runtime follows the pointer.
+    zero_addr = getattr(prof, 'zero_list_addr', None)
+    if zero_addr is not None and zero_addr != base + (len(records) + 1) * 16:
+        if not (prof.data4_va <= zero_addr and zero_addr + 16 <= prof.data4_va + prof.data4_sz):
+            raise ValueError('zeroList terminator falls outside the Data4 region')
+        enc5 = e.encrypt_data5_record(b'\x00' * 16, zero_addr)
+        raw_shell[zero_addr:zero_addr + 16] = enc5
+        e.encrypt_data4_at(raw_shell, zero_addr, 16, prof.data4_va)
 
     # 5. emit: header+info+Data2 (S's, with target section table) + payload + sections
     out = bytearray(S_fd[:cdo]) + bytes(payload)
@@ -2494,8 +2613,8 @@ def load_target_image(path, layout='auto'):
         raise ValueError('target is not a PE file (missing PE signature)')
     opt = u16(raw, pe + 20)
     magic = u16(raw, pe + 24)
-    if magic != 0x20B:
-        raise ValueError(f'target is not PE32+ (optional magic 0x{magic:X})')
+    if magic not in (0x10B, 0x20B):
+        raise ValueError(f'target is not PE32/PE32+ (optional magic 0x{magic:X})')
     nsec = u16(raw, pe + 6)
     if not 1 <= nsec <= 96:
         raise ValueError(f'invalid section count: {nsec}')
@@ -2542,7 +2661,7 @@ def _do_pack(argv):
         description='CrackProof-format packer with automatic runtime-profile selection. '
                     'The target may be a flat unpacked image or a normal file-layout PE. Output defaults to '
                     '<name>.packed<ext>.')
-    ap.add_argument('target', help='unpacked PE32+ program to pack')
+    ap.add_argument('target', help='unpacked PE32/PE32+ program to pack')
     ap.add_argument('profile', nargs='?', default=None,
                     help='stub profile override (default: auto-select by PE/CLR type)')
     ap.add_argument('-o', '--output', help='output path (default: <name>.packed<ext>)')
@@ -2608,7 +2727,7 @@ def _do_extract(argv):
     ap = argparse.ArgumentParser(
         prog='Nyaencrypt.py extract',
         description='Extract a reusable stub profile from a packed CrackProof sample.')
-    ap.add_argument('template', help='packed CrackProof PE32+ sample')
+    ap.add_argument('template', help='packed CrackProof PE32/PE32+ sample')
     ap.add_argument('profile', help='output profile path')
     ap.add_argument('--aes-dir', default=None, help='AES table dir (default: generate in code)')
     args = ap.parse_args(argv)
