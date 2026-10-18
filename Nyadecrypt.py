@@ -907,6 +907,96 @@ def _parse_target_hdr_trailer(buf):
     return dict(nsec=nsec, simg=simg, shdr=shdr, flags=flags, sectbl=sectbl, hdr=hdr)
 
 
+def _target_import_spec(tgt_hdr):
+    """Return the target import directory and thunk width from CPXSECT."""
+    hdr = tgt_hdr.get('hdr')
+    if not hdr or len(hdr) < 0x40:
+        return None
+    try:
+        pe = struct.unpack_from('<I', hdr, 0x3C)[0]
+        if pe + 0x78 > len(hdr) or hdr[pe:pe + 4] != b'PE\0\0':
+            return None
+        magic = struct.unpack_from('<H', hdr, pe + 24)[0]
+        if magic == 0x10B:
+            dir_base, thunk_size = pe + 0x78, 4
+        elif magic == 0x20B:
+            dir_base, thunk_size = pe + 0x88, 8
+        else:
+            return None
+        if dir_base + 16 > len(hdr):
+            return None
+        rva, size = struct.unpack_from('<II', hdr, dir_base + 8)
+        return dict(rva=rva, size=size, thunk_size=thunk_size)
+    except (struct.error, IndexError):
+        return None
+
+
+def _decrypt_target_import_names(data, spec):
+    """Reverse encrypt_target_imports() using the TARGET's thunk width.
+
+    The packed stub may be PE32+ while the target is PE32 (for example the
+    chusanApp family). Using the stub metadata here either finds no imports or
+    walks them with the wrong thunk width. CPXSECT carries the target import
+    directory, so decrypt the names in-place without normalizing or clearing any
+    hint bytes; this is the exact inverse of the packer.
+    """
+    if not spec:
+        return 0
+    irva, size = spec['rva'], spec['size']
+    if not (0x1000 < irva < len(data)):
+        return 0
+    n = len(data)
+    pos = irva
+    end = min(n, irva + size) if 0 < size < 0x10000 else n
+    ordinal_bit = 0x80000000 if spec['thunk_size'] == 4 else 0x8000000000000000
+    fmt = '<I' if spec['thunk_size'] == 4 else '<Q'
+    count = 0
+    while pos + 20 <= end:
+        name_rva = u32(data, pos + 12)
+        oft = u32(data, pos)
+        iat = u32(data, pos + 16)
+        if name_rva == 0 and oft == 0 and iat == 0:
+            break
+        if 0 < name_rva < n:
+            decrypt_data7(data, name_rva, name_rva & 0xFF)
+        thunk = oft if oft else iat
+        step = spec['thunk_size']
+        while thunk and thunk + step <= n:
+            value = struct.unpack_from(fmt, data, thunk)[0]
+            if value == 0:
+                break
+            if not (value & ordinal_bit):
+                hint_name = value & 0xFFFFFFFF
+                if 0 < hint_name + 2 < n:
+                    decrypt_data7(data, hint_name + 2, hint_name & 0xFF)
+            thunk += step
+        count += 1
+        pos += 20
+    return count
+
+
+def _target_header_is_flat(tgt_hdr):
+    """True when the carried target header uses PtrRaw==RVA sections."""
+    hdr = tgt_hdr.get('hdr')
+    if not hdr or len(hdr) < 0x40:
+        return True
+    try:
+        pe = struct.unpack_from('<I', hdr, 0x3C)[0]
+        nsec = struct.unpack_from('<H', hdr, pe + 6)[0]
+        optsz = struct.unpack_from('<H', hdr, pe + 20)[0]
+        st = pe + 24 + optsz
+        for i in range(nsec):
+            sh = st + i * 40
+            va = struct.unpack_from('<I', hdr, sh + 12)[0]
+            rawsz = struct.unpack_from('<I', hdr, sh + 16)[0]
+            rawptr = struct.unpack_from('<I', hdr, sh + 20)[0]
+            if rawsz and rawptr != va:
+                return False
+        return True
+    except (struct.error, IndexError):
+        return True
+
+
 def _apply_target_hdr(data, tgt_hdr):
     """Rewrite NumberOfSections / SizeOfImage / SizeOfHeaders / section table with
     the carried target values and resize the flat (file==RVA) image to the target
@@ -1936,7 +2026,10 @@ def _decrypt_file(in_file, file_data):
             sec_name = file_data[sec_hdr:sec_hdr + 8]
             if sec_name[:5] == b'.text':
                 text_off, text_size = va, sz
-            if export_va >= va and export_va + export_size <= va + sz:
+            # Cross-layout repacks already carry the target export table in the
+            # decoded program image. The packed raw section belongs to the donor
+            # stub, so restoring from it would overwrite the target exports.
+            if _tgt_hdr is None and export_va >= va and export_va + export_size <= va + sz:
                 export_file_off = export_va - va + f_off
             # SizeOfRawData = VirtualSize, PointerToRawData = VirtualAddress
             w32(data, sec_hdr + 16, sz)
@@ -1946,7 +2039,7 @@ def _decrypt_file(in_file, file_data):
                 w32(data, sec_hdr + 36, 0xC0000040)
             sec_hdr += 40
 
-        if export_size != 0 and export_file_off != 0:
+        if _tgt_hdr is None and export_size != 0 and export_file_off != 0:
             data[export_va:export_va + export_size] = file_data[export_file_off:export_file_off + export_size]
             print(f'  Restored export table at 0x{export_va:X}')
 
@@ -2062,7 +2155,14 @@ def _decrypt_file(in_file, file_data):
         # null-terminated and the standard name_rva == 0 stop is sufficient.
         dll_count = 0
         iat_min, iat_max = 0xFFFFFFFF, 0
-        if import_rva_final:
+        target_import = (_target_import_spec(_tgt_hdr)
+                         if (_tgt_hdr is not None and (_tgt_hdr.get('flags', 0) & 2))
+                         else None)
+        if target_import is not None:
+            dll_count = _decrypt_target_import_names(data, target_import)
+            print(f'  Target imports restored from CPXSECT: {dll_count} DLLs, '
+                  f'Import RVA=0x{target_import["rva"]:X} Size=0x{target_import["size"]:X}')
+        if import_rva_final and target_import is None:
             pos = import_rva_final
             while pos + 20 <= len(data):
                 name_rva = u32(data, pos + 12)
@@ -2219,9 +2319,14 @@ def _decrypt_file(in_file, file_data):
 
         # ---- Write output ----
         if _tgt_hdr is not None:
+            target_was_flat = _target_header_is_flat(_tgt_hdr)
             _apply_target_hdr(data, _tgt_hdr)
+            out_pe = u32(data, 0x3C)
+            if not target_was_flat:
+                data = compact_memory_image_to_pe(data, out_pe)
             print(f'  [+] rebuilt final PE header from cross-layout trailer '
                   f'(nsec={_tgt_hdr["nsec"]}, SizeOfImage=0x{_tgt_hdr["simg"]:X}, '
+                  f'layout={"flat" if target_was_flat else "compact"}, '
                   f'output 0x{len(data):X} bytes)')
         dot = in_file.rfind('.')
         out_file = in_file[:dot] + '.unpack' + in_file[dot:] if dot >= 0 else in_file + '.unpack'

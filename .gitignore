@@ -6,3 +6,9 @@ __pycache__/
 *-pack-roundtrip.log
 *.packed.unpack.dll
 *.packed.unpack.exe
+
+# Local unpack/repack outputs
+*.unpack.exe
+*.unpack.dll
+*.unpack.packed.exe
+*.unpack.packed.dll

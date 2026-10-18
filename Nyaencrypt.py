@@ -4,7 +4,7 @@ Auto-merged from pack.py + crackproof_repack.py +
 crackproof_encrypt_primitives.py + crackproof_lz.py. The only remaining
 dependency is the sibling unpacker Nyadecrypt.py (with legacy decrypt.py fallback) (loaded as
 `d`), which is reused to parse the runtime profile before re-packing, plus the
-bundled native-EXE and managed-DLL runtime profiles. AES tables are generated in code when the aes_*
+bundled native-EXE, native-DLL and managed-DLL runtime profiles. AES tables are generated in code when the aes_*
 files / aes-dir are absent.
 
 Usage:
@@ -2054,13 +2054,15 @@ def cmd_m0(path, aes_dir):
 
 
 # Bundled canonical runtime profiles.  They are format/runtime profiles, not a
-# universal header: profile class must match the target (native EXE, managed DLL,
-# etc.).  AES tables are generated in code.
+# universal header: profile class must match the target (native EXE, native
+# DLL by architecture, managed DLL, etc.). AES tables are generated in code.
 BUNDLED_PROFILE = Path(__file__).resolve().parent / 'stub_profile.bin'
 BUNDLED_DOTNET_DLL_PROFILE = (Path(__file__).resolve().parent /
                               'stub_profile_dotnet_dll.bin')
 BUNDLED_NATIVE_DLL_PROFILE = (Path(__file__).resolve().parent /
                               'stub_profile_native_dll.bin')
+BUNDLED_NATIVE_DLL_PE32_PROFILE = (Path(__file__).resolve().parent /
+                                   'stub_profile_native_dll_pe32.bin')
 
 
 def _load_profile(path):
@@ -2161,7 +2163,7 @@ def encrypt_target_imports(img, tgt):
 _TGT_HDR_MAGIC = b'CPXSECT\x00'
 
 
-def _build_target_hdr_trailer(T):
+def _build_target_hdr_trailer(T, encrypt_imports=False, target_meta=None):
     """EOF trailer carrying the target's NumberOfSections / SizeOfImage /
     SizeOfHeaders / raw section table AND the target's verbatim header region
     [0:SizeOfHeaders], so decrypt can rebuild the final PE header byte-for-byte
@@ -2172,19 +2174,28 @@ def _build_target_hdr_trailer(T):
     payload = <IIII nsec,simg,shdr,flags> + sectbl + <I hdrlen> + hdrbytes
     (hdrlen/hdrbytes are an optional tail; old parsers stop after sectbl).
     flags bit0 = SKIP_D8 (embedded .text is final plaintext)."""
-    pe = u32(T, 0x3C)
-    optsz = u16(T, pe + 0x14)
-    nsec = u16(T, pe + 6)
-    simg = u32(T, pe + 0x50)
-    shdr = u32(T, pe + 0x54)
+    # T is normalized to file-offset==RVA for payload encoding. Preserve the
+    # caller's original header bytes (which may use compact raw pointers) so
+    # decrypt can recreate the exact on-disk layout after rebuilding the image.
+    header_src = T
+    if target_meta and target_meta.get('header'):
+        header_src = target_meta['header']
+    pe = u32(header_src, 0x3C)
+    optsz = u16(header_src, pe + 0x14)
+    nsec = u16(header_src, pe + 6)
+    simg = u32(header_src, pe + 0x50)
+    shdr = u32(header_src, pe + 0x54)
     st = pe + 0x18 + optsz
-    sectbl = bytes(T[st:st + nsec * 40])
+    sectbl = bytes(header_src[st:st + nsec * 40])
     flags = 1  # bit0: embedded .text is final plaintext -> decrypt must skip decrypt_data8
+    import_dir = pe + (0x78 if u16(T, pe + 24) == 0x10B else 0x88) + 8
+    if encrypt_imports and u32(T, import_dir):
+        flags |= 2  # bit1: target import names are Data7-encrypted in the payload
     # Verbatim target header region. Must cover at least through the section
     # table; clamp to the actual target length so we never read past EOF.
     hdr_len = max(shdr, st + nsec * 40)
-    hdr_len = min(hdr_len, len(T))
-    hdr_bytes = bytes(T[:hdr_len])
+    hdr_len = min(hdr_len, len(header_src))
+    hdr_bytes = bytes(header_src[:hdr_len])
     payload = (struct.pack('<IIII', nsec, simg, shdr, flags) + sectbl
                + struct.pack('<I', len(hdr_bytes)) + hdr_bytes)
     crc = zlib.crc32(payload) & 0xFFFFFFFF
@@ -2278,7 +2289,8 @@ def _validate_loader_view(out, T, tgt):
 
 
 # ----------------------------------------------------------------- pack
-def pack_program(prof, S_fd, T, use_lz=False, do_imports=True, overlap=False):
+def pack_program(prof, S_fd, T, use_lz=False, do_imports=True, overlap=False,
+                 target_meta=None):
     info = prof.info
     info3 = info[3]
     cdo = prof.compress_data_offset
@@ -2418,7 +2430,8 @@ def pack_program(prof, S_fd, T, use_lz=False, do_imports=True, overlap=False):
     _validate_loader_view(out, T, tgt)
     # EOF trailer: target section table + SKIP_D8 so decrypt rebuilds the final PE
     # header and skips decrypt_data8 (embedded .text is already final plaintext).
-    out.extend(_build_target_hdr_trailer(T))
+    out.extend(_build_target_hdr_trailer(T, encrypt_imports=do_imports,
+                                         target_meta=target_meta))
     return out, prog_end
 
 
@@ -2602,7 +2615,7 @@ def _target_range(buf, off, size, label):
         raise ValueError(f'{label} is outside target (off=0x{off:X}, size=0x{size:X})')
 
 
-def load_target_image(path, layout='auto'):
+def load_target_image(path, layout='auto', with_meta=False):
     """Return a flat file-offset==RVA target image for the CrackProof file loop."""
     raw = bytearray(Path(path).read_bytes())
     if len(raw) < 0x40 or raw[:2] != b'MZ':
@@ -2633,13 +2646,16 @@ def load_target_image(path, layout='auto'):
     flat_layout = all(rawsz == 0 or rawptr == va for vs, va, rawsz, rawptr, s in sections)
     if layout == 'auto':
         layout = 'flat' if len(raw) >= image_size and flat_layout else 'file'
+    if layout not in ('flat', 'file'):
+        raise ValueError(f'unknown input layout: {layout}')
+    # Keep the source header independent of the normalized flat payload image.
+    source_hdr_len = min(len(raw), max(headers_size, sectab + nsec * 40))
+    target_meta = {'header': bytes(raw[:source_hdr_len]), 'layout': layout}
     if layout == 'flat':
         if len(raw) < image_size:
             raise ValueError(f'flat target is shorter than SizeOfImage: 0x{len(raw):X} < 0x{image_size:X}')
         del raw[image_size:]
-        return raw
-    if layout != 'file':
-        raise ValueError(f'unknown input layout: {layout}')
+        return (raw, target_meta) if with_meta else raw
     image = bytearray(image_size)
     image[:min(headers_size, len(raw))] = raw[:min(headers_size, len(raw))]
     for vs, va, rawsz, rawptr, sh in sections:
@@ -2651,7 +2667,7 @@ def load_target_image(path, layout='auto'):
         image[va:va + count] = raw[rawptr:rawptr + count]
         w32(image, sh + 16, min(vs, image_size - va))
         w32(image, sh + 20, va)
-    return image
+    return (image, target_meta) if with_meta else image
 
 
 # ----------------------------------------------------------------- cli
@@ -2679,7 +2695,7 @@ def _do_pack(argv):
 
     r.load_tables(aes_dir)
     tgt_path = Path(args.target)
-    T = load_target_image(tgt_path, args.input_layout)
+    T, target_meta = load_target_image(tgt_path, args.input_layout, with_meta=True)
     tgt_info = parse_target(T)
 
     if args.profile:
@@ -2689,8 +2705,12 @@ def _do_pack(argv):
         prof_path = BUNDLED_DOTNET_DLL_PROFILE
         profile_reason = '.NET DLL (CLR directory present)'
     elif tgt_info['is_dll']:
-        prof_path = BUNDLED_NATIVE_DLL_PROFILE
-        profile_reason = 'native DLL'
+        if tgt_info['is_pe32']:
+            prof_path = BUNDLED_NATIVE_DLL_PE32_PROFILE
+            profile_reason = 'native PE32 DLL'
+        else:
+            prof_path = BUNDLED_NATIVE_DLL_PROFILE
+            profile_reason = 'native PE32+ DLL'
     elif tgt_info['clr_rva']:
         raise ValueError('managed EXE needs a managed-EXE CrackProof runtime profile; '
                          'refusing to apply the native EXE profile')
@@ -2700,7 +2720,7 @@ def _do_pack(argv):
 
     if not Path(prof_path).exists():
         print(f'profile not found for {profile_reason}: {prof_path}\n'
-              f'(extract one with: python Nyaencrypt.py extract <packed_sample.exe> <profile>)')
+              f'(extract one with: python Nyaencrypt.py extract <packed_sample> <profile>)')
         return 2
     blob = _load_profile(prof_path)
     prof = blob['prof']
@@ -2713,7 +2733,8 @@ def _do_pack(argv):
           f'info3=0x{prof.info[3]:X}) ...')
     out, prog_end = pack_program(prof, S_fd, T, use_lz=args.lz,
                                  do_imports=not args.no_imports,
-                                 overlap=not args.no_overlap)
+                                 overlap=not args.no_overlap,
+                                 target_meta=target_meta)
     out_path.write_bytes(out)
     print(f'[+] wrote {out_path.name} (0x{len(out):X} bytes)')
     if not args.no_verify:

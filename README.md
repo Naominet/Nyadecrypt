@@ -5,7 +5,7 @@
 本仓库包含：
 
 - `Nyadecrypt.py`：CrackProof PE 脱壳器；
-- `Nyaencrypt.py`：将脱壳结果重新编码为 CrackProof 格式的 profile 驱动加壳器。
+- `Nyaencrypt.py`：程序重新加壳为 CrackProof 格式的 profile 加壳器。
 
 > 本工具用于已获授权的软件分析、兼容性研究和数据恢复。请确保使用行为符合适用法律及授权范围。
 
@@ -27,7 +27,7 @@
 
 ### 加壳工具
 
-10. 工具定位
+10. 加壳
 11. 加壳基本命令
 12. 输入布局和输出文件
 13. 加壳命令行选项
@@ -35,9 +35,9 @@
 15. 从样本提取 profile
 16. 加壳流程
 17. .NET DLL 处理
-18. 验证方法
-19. 常见错误
-20. 加壳限制
+18. 常见错误
+19. 加壳限制
+20. 回环验证
 
 ---
 
@@ -76,7 +76,7 @@ python Nyadecrypt.py <folder>
 - 一张按 32 位字复制的逆 S-box 表；
 - 每张表 256 个 uint32；
 
-这些表属于标准 AES 常量，不是目标文件专属数据。gen_aes_tables() 在程序启动时根据有限域运算生成它们。
+这些表属于标准 AES 常量，不是目标文件专属数据。gen_aes_tables() 由程序计算生成。
 
 ---
 
@@ -133,9 +133,9 @@ PE32+ 路径优先通过稳定特征动态定位内部字段；PE32 路径保留
 
 ### 4.4 Stage 4：ThirdStage
 
-ThirdStage 中包含 key slots、信息表和下一阶段入口。程序通过结构特征寻找 infoTable，再反推出密钥区域，而不是只依赖一个绝对偏移。
+ThirdStage 中包含 key slots、信息表和下一阶段入口。程序通过结构特征寻找 infoTable，再反推出密钥区域，而不只依赖一个固定偏移。
 
-信息表中的记录可能表示：
+信息表中的记录可能包含：
 
 - 解密操作；
 - 数据复制操作；
@@ -167,7 +167,7 @@ EighthStage 提供最终文件数据还原所需的信息，包括：
 - 需要清零的区域；
 - PE 元数据。
 
-内部偏移会因位数和壳布局变化，因此程序结合候选偏移、范围检查、结构有效性和内容评分进行选择。
+内部偏移会因位数和壳布局变化，因此程序结合候选偏移、范围检查、结构有效性和内容进行选择。
 
 ---
 
@@ -306,8 +306,6 @@ AES 使用壳中保存的解密密钥调度。普通轮使用四张 T-table，�
 
 ## 8 已修复问题
 
-旧文档中的逐文件、逐日期调试记录已经合并为以下通用问题表。
-
 ### 8.1 阶段定位和候选选择
 
 | 问题 | 原因 | 当前处理 |
@@ -323,7 +321,6 @@ AES 使用壳中保存的解密密钥调度。普通轮使用四张 T-table，�
 
 | 问题 | 原因 | 当前处理 |
 |---|---|---|
-| AES 表文件缺失导致无法运行 | 依赖五个外部二进制表 | 启动时生成标准 AES 表，旧文件仅作可选兼容 |
 | PE32 文件级 LFSR 定位失败 | 偏移列表和选择条件不足 | 增加候选并验证解密后的块结构 |
 | PE32+ 文件级 LFSR 选错 | 多个候选都满足浅层条件 | 对完整输出、边界和后续结构联合评分 |
 | 文件校验循环越界 | 结束条件没有限制表范围 | 增加显式长度、计数和地址检查 |
@@ -375,7 +372,7 @@ AES 使用壳中保存的解密密钥调度。普通轮使用四张 T-table，�
 
 ---
 
-## 10 工具定位
+## 10 加壳
 
 `Nyaencrypt.py` 将脱壳得到的 PE32/PE32+ 程序重新编码为 CrackProof 数据链，包括：
 
@@ -385,7 +382,7 @@ AES 使用壳中保存的解密密钥调度。普通轮使用四张 T-table，�
 - AES-256、LFSR 和可选 LZ 压缩；
 - 文件校验、导入信息和 PE 元数据。
 
-输出不是旧的 `.nyapck` 自定义加载器，而是当前 [Nyadecrypt.py](Nyadecrypt.py) 可以解析的 CrackProof 格式。
+输出是 [Nyadecrypt.py](Nyadecrypt.py) 可以解析的 CrackProof 格式。
 
 本工具目前是 **profile 驱动的 CrackProof 重打包器**。profile 提供壳运行时、阶段布局和可复用 stub，目标程序由工具重新编码。它还不是可以脱离原始壳样本、为任意 PE 自动生成完整 native stub 的 donorless 编译器。
 
@@ -404,13 +401,6 @@ python Nyaencrypt.py <unpacked_pe> -o <packed_pe>
 ~~~text
 program.unpack.exe  -> program.unpack.packed.exe
 module.unpack.dll   -> module.unpack.packed.dll
-~~~
-
-示例：
-
-~~~bash
-python Nyaencrypt.py SDDT115Assembly-CSharp.unpack.dll --lz
-python Nyaencrypt.py SDDT155amdaemon.unpack.exe --lz
 ~~~
 
 建议保留 `--lz`。不加 `--lz` 时仍会执行 LFSR 和 AES 编码，只是文件块按未压缩形式保存；加 `--lz` 后，能在压缩后变小的块会使用真实 LZ 编码。
@@ -472,7 +462,8 @@ python Nyaencrypt.py [-h] [-o OUTPUT] [--lz] [--no-overlap] [--no-verify]
 |---|---|---|
 | .NET DLL，存在 CLR 目录 | `stub_profile_dotnet_dll.bin` | 已提供，要求节布局兼容 |
 | Native EXE，无 CLR 目录 | `stub_profile.bin` | 已提供 |
-| Native DLL | `stub_profile_native_dll.bin` | 仓库尚未提供，默认拒绝 |
+| Native DLL，PE32+ | `stub_profile_native_dll.bin` | 已提供，自动选择 |
+| Native DLL，PE32 | `stub_profile_native_dll_pe32.bin` | 已提供，自动选择 |
 | Managed EXE，存在 CLR 目录 | 无默认 profile | 默认拒绝，避免误用 native EXE profile |
 
 也可以显式指定 profile：
@@ -481,7 +472,7 @@ python Nyaencrypt.py [-h] [-o OUTPUT] [--lz] [--no-overlap] [--no-verify]
 python Nyaencrypt.py target.dll sample.profile.bin --lz -o target.packed.dll
 ~~~
 
-profile 必须与目标文件的架构、DLL/EXE 类型、CrackProof 版本和关键节布局匹配。对 .NET DLL，工具会执行 fail-closed 校验；错误的 profile 或不兼容布局会被拒绝，不会静默生成一个看似 native/C++ 的损坏 DLL。
+profile 必须与目标文件的架构、DLL/EXE 类型、CrackProof 版本和关键布局匹配。Native DLL 会按 PE32/PE32+ 自动选择内置 profile；Native EXE 和 Native DLL 支持跨节布局重打包。对 .NET DLL，工具仍要求与所选 profile 的节布局兼容，并执行 COR20/BSJB fail-closed 校验；错误 profile 或不兼容布局会被拒绝，不会静默生成一个看似 native/C++ 的损坏 DLL。
 
 ---
 
@@ -496,15 +487,13 @@ python Nyaencrypt.py extract <packed_sample> <profile.bin>
 示例：
 
 ~~~bash
-python Nyaencrypt.py extract SDDT115Assembly-CSharp.dll SDDT115Assembly-CSharp.profile.bin
-python Nyaencrypt.py SDDT115Assembly-CSharp.unpack.dll SDDT115Assembly-CSharp.profile.bin --lz -o SDDT115Assembly-CSharp.repacked.dll
+python Nyaencrypt.py extract ；leakproof.dll leakproof.profile.bin
+python Nyaencrypt.py leakproof.unpack.dll leakproof.profile.bin --lz -o leakproof.repacked.dll
 ~~~
 
 提取 profile 不等于实现对任意输入完全免依赖加壳。profile 仍来自具体 CrackProof 样本，并复用了该样本的运行时布局和 stub 数据。优先选择与目标程序具有相同架构、类型、节布局和壳版本的样本。
 
-profile 为可信二进制数据，加载时使用 Python pickle。不要加载来源不明或被篡改的 profile。
-
-查看提取命令帮助：
+profile 为可信二进制数据，加载时使用 Python pickle。
 
 ~~~bash
 python Nyaencrypt.py extract --help
@@ -566,6 +555,20 @@ CrackProof 的 native 重打包使用 overlap 设计，使完整目标映像仍�
 
 ---
 
+### 16.5 跨布局与精确回环
+
+跨布局重打包时，`Nyaencrypt.py` 会在文件尾部写入 `CPXSECT` 元数据；Windows 加载器会忽略该 overlay，`Nyadecrypt.py` 则用它恢复目标的最终 PE 布局。该元数据包含：
+
+- 目标 `NumberOfSections`、`SizeOfImage`、`SizeOfHeaders` 和原始节表；
+- 目标原始 PE 头（包括 DOS stub、`e_lfanew` 和 section raw pointer）；
+- 标志位：目标 `.text` 已是明文，以及目标导入名已执行 Data7 加密。
+
+脱壳时，工具按目标 PE 类型选择 PE32 的 4 字节 thunk 或 PE32+ 的 8 字节 thunk，以目标 Import Directory 为准反向还原 DLL 名称和函数名，不依赖 packed stub 自身的导入元数据。随后按目标原始头恢复 compact 或 flat 布局。因此，同一目标经过“加壳 -> 脱壳”后可以恢复为逐字节一致的 PE，包括导入区和原始节布局。
+
+`CPXSECT` 只解决 profile 重打包时的目标布局和可逆编码问题；本工具仍然需要匹配的 runtime profile，并不是脱离壳样本的 donorless stub 生成器。
+
+---
+
 ## 17 .NET DLL 处理
 
 托管 DLL 不能只把 CLR 数据放进压缩层。Windows 和 .NET 反射工具需要在壳运行前从加载器可见的原始节中读取 COR20 和 metadata，因此工具会：
@@ -577,65 +580,16 @@ CrackProof 的 native 重打包使用 overlap 设计，使完整目标映像仍�
 5. 校验 DLL/EXE 标志、CLR 目录、COR20、metadata 签名和大小；
 6. 拒绝不兼容的节布局，而不是输出损坏的伪 native DLL。
 
-加壳后的 DLL 可用 PowerShell 检查程序集名：
-
-~~~powershell
-[Reflection.AssemblyName]::GetAssemblyName((Resolve-Path .\module.packed.dll))
-~~~
-
-成功时应返回目标的程序集名称，而不是 `BadImageFormatException`。
-
 ---
 
-## 18 验证方法
-
-默认情况下，工具会在写出文件后重新解析输出，并验证 embedded program 能恢复到目标程序区。导入节允许存在差异，因为导入名称在解码映像中处于 Data7 混淆状态。
-
-成功时会显示类似信息：
-
-~~~text
-VERIFY OK: embedded program reconstructs to the target (import-dir diffs only)
-~~~
-
-也可以执行完整脱壳回环：
-
-~~~bash
-python Nyaencrypt.py module.unpack.dll --lz -o module.packed.dll
-python Nyadecrypt.py module.packed.dll
-~~~
-
-预期生成：
-
-~~~text
-module.packed.unpack.dll
-~~~
-
-比较输入和回环输出的 SHA-256：
-
-~~~powershell
-Get-FileHash .\module.unpack.dll -Algorithm SHA256
-Get-FileHash .\module.packed.unpack.dll -Algorithm SHA256
-~~~
-
-两个哈希一致，说明该样本在当前 profile 和布局下完成了严格字节回环。
-
-截至 2026-09-23，在 `F:\0000amdaemon\crackproof` 的 95 个带壳样本上，95 个均能完成脱壳、重新加壳和再次脱壳；其中 94 个 SHA-256 完全一致。唯一未完全一致的 EXE 为 `SDER142InitialD0_DX11_Nu_CHN.exe`，文件大小和程序流程一致，但在 `.rdata` 偏移 `0x160FC62` 处有 2 字节差异：
-
-~~~text
-原始带壳文件：35 06
-恢复文件：    00 00
-~~~
-
----
-
-## 19 常见错误
+## 18 常见错误
 
 | 错误信息 | 含义 | 处理方式 |
 |---|---|---|
 | `target is not a PE file` | 输入缺少 MZ/PE 签名 | 确认输入是有效 PE |
 | `unsupported optional-header magic` | 不是 PE32/PE32+，或头已损坏 | 修复或重新脱壳 |
 | `managed EXE needs ... profile` | 没有托管 EXE 的默认 runtime profile | 提取兼容 profile 并显式传入 |
-| `profile not found for native DLL` | 缺少 native DLL profile | 提取兼容 profile 并显式传入 |
+| `profile not found for native DLL` | 缺少对应架构的 native DLL profile | 恢复 `stub_profile_native_dll*.bin`，或提取兼容 profile 后显式传入 |
 | `managed PE layout is incompatible` | 目标节布局与托管 DLL profile 不匹配 | 使用同布局样本重新提取 profile |
 | `managed target became native` | 输出丢失加载器可见 CLR 信息 | 使用正确的托管 DLL profile，不要强制 native profile |
 | `packed CLR metadata ...` | COR20/BSJB 不匹配或不可见 | 检查 profile、目标 metadata 和节布局 |
@@ -646,16 +600,13 @@ Get-FileHash .\module.packed.unpack.dll -Algorithm SHA256
 
 ---
 
-## 20 加壳限制
+## 19 加壳限制
 
-- 工具仍是 profile 驱动的 CrackProof 重打包器，不是完整的 donorless native-stage 编译器。
-- 新壳变体仍可能需要从其样本提取新的 runtime profile。
-- 默认未提供 native DLL 和 managed EXE profile；这两类输入会 fail-closed。
-- 托管 DLL 必须与 profile 的节布局兼容，且 COR20/BSJB metadata 必须有效。
-- 纯 IL 程序、混合模式程序和新版 native stage 可能需要额外兼容工作。
-- `--no-overlap`、`--no-imports` 和 `--no-verify` 只用于调试，不应作为正常加壳流程。
-- 字节级 SHA-256 回环可作为强验证，但不能替代目标环境的加载和运行测试。
-
+- 新壳仍可能需要从样本提取新的 runtime profile。
+- Native EXE/native DLL 支持跨节布局；托管 DLL 仍必须与 profile 的节布局兼容，且 COR20/BSJB metadata 必须有效。
+- 纯 IL 程序、混合模式程序和新版 native stage 可能需要额外兼容。
+- 随便做着玩的 不确定能用 仅供参考研究
 ---
+
 
 Copyright (C) 2026 Nyadecrypt contributors.
